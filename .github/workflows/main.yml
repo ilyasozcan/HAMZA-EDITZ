@@ -6,9 +6,6 @@ on:
 jobs:
   secure-rdp:
     runs-on: windows-latest
-
-    # GitHub-hosted runner'larda pratik üst sınır runner limitine bağlıdır.
-    # 360 dakika = 6 saat.
     timeout-minutes: 360
 
     steps:
@@ -35,17 +32,48 @@ jobs:
             -Value 0 `
             -Force
 
-          # Use standard RDP security layer
+          # Standard RDP security layer
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name 'SecurityLayer' `
             -Value 0 `
             -Force
 
-          # Remove previous firewall rule
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+          # ========================================================
+          # CLIPBOARD / COPY-PASTE
+          # ========================================================
 
-          # Allow TCP 3389
+          $policyPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+
+          New-Item `
+            -Path $policyPath `
+            -Force | Out-Null
+
+          # Clipboard redirection allowed
+          New-ItemProperty `
+            -Path $policyPath `
+            -Name 'fDisableClip' `
+            -PropertyType DWord `
+            -Value 0 `
+            -Force | Out-Null
+
+          # RDP-Tcp clipboard allowed
+          New-ItemProperty `
+            -Path 'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'fDisableClip' `
+            -PropertyType DWord `
+            -Value 0 `
+            -Force | Out-Null
+
+          Write-Host "Clipboard redirection enabled."
+
+          # ========================================================
+          # FIREWALL
+          # ========================================================
+
+          netsh advfirewall firewall delete rule `
+            name="RDP-Tailscale" 2>$null
+
           netsh advfirewall firewall add rule `
             name="RDP-Tailscale" `
             dir=in `
@@ -59,80 +87,70 @@ jobs:
           Write-Host "RDP configuration completed."
 
       # ============================================================
-      # 2. CREATE USER
+      # 2. CREATE RDP USER
       # ============================================================
       - name: Create RDP User
         shell: powershell
         run: |
           Write-Host "=== Creating RDP User ==="
 
-          # Remove user if it already exists
-          $existingUser = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          $username = "RDP"
+
+          # Easy fixed password requested
+          $password = "Rdp12345!"
+
+          # Remove old account if present
+          $existingUser = Get-LocalUser `
+            -Name $username `
+            -ErrorAction SilentlyContinue
 
           if ($existingUser) {
-              Write-Host "Existing RDP user found. Removing..."
-              Remove-LocalUser -Name "RDP"
+              Write-Host "Existing RDP account found. Removing..."
+              Remove-LocalUser -Name $username
           }
 
-          # Character sets
-          $upper   = [char[]](65..90)
-          $lower   = [char[]](97..122)
-          $numbers = [char[]](48..57)
-
-          $special = @(
-              [char[]](33..47)
-              [char[]](58..64)
-              [char[]](91..96)
-              [char[]](123..126)
-          )
-
-          $special = $special | ForEach-Object { $_ }
-
-          # Generate password
-          $passwordChars = @()
-
-          $passwordChars += $upper   | Get-Random -Count 4
-          $passwordChars += $lower   | Get-Random -Count 4
-          $passwordChars += $numbers | Get-Random -Count 4
-          $passwordChars += $special | Get-Random -Count 4
-
-          $password = -join ($passwordChars | Sort-Object { Get-Random })
-
+          # Secure password
           $securePassword = ConvertTo-SecureString `
             $password `
             -AsPlainText `
             -Force
 
-          # Create account
+          # Create user
           New-LocalUser `
-            -Name "RDP" `
+            -Name $username `
             -Password $securePassword `
             -AccountNeverExpires `
-            -PasswordNeverExpires:$true
+            -PasswordNeverExpires:$true `
+            -UserMayNotChangePassword:$true
 
-          # Add administrator permissions
+          # Administrators
           Add-LocalGroupMember `
             -Group "Administrators" `
-            -Member "RDP"
+            -Member $username
 
-          # Add Remote Desktop permissions
+          # Remote Desktop Users
           Add-LocalGroupMember `
             -Group "Remote Desktop Users" `
-            -Member "RDP"
+            -Member $username
+
+          # Make sure account is enabled
+          Enable-LocalUser -Name $username
 
           # Verify
-          $user = Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+          $user = Get-LocalUser `
+            -Name $username `
+            -ErrorAction SilentlyContinue
 
           if (-not $user) {
               Write-Error "Failed to create RDP user."
               exit 1
           }
 
-          # Store credentials for following steps
-          "RDP_USERNAME=RDP" >> $env:GITHUB_ENV
-          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
-
           Write-Host "RDP user created successfully."
+
+          # Save for later steps
+          "RDP_USERNAME=.\RDP" >> $env:GITHUB_ENV
+          "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
 
       # ============================================================
       # 3. INSTALL TAILSCALE
@@ -142,19 +160,12 @@ jobs:
         run: |
           Write-Host "=== Installing Tailscale ==="
 
-          # Current stable Windows AMD64 MSI
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.98.10-amd64.msi"
-
-          # Safe Windows temporary path
           $installerPath = Join-Path $env:TEMP "tailscale.msi"
 
           Write-Host "Download URL:"
           Write-Host $tsUrl
 
-          Write-Host "Installer path:"
-          Write-Host $installerPath
-
-          # Download MSI
           Invoke-WebRequest `
             -Uri $tsUrl `
             -OutFile $installerPath `
@@ -165,9 +176,6 @@ jobs:
               exit 1
           }
 
-          Write-Host "Tailscale MSI downloaded."
-
-          # Install silently
           $process = Start-Process `
             -FilePath "msiexec.exe" `
             -ArgumentList @(
@@ -180,13 +188,13 @@ jobs:
             -PassThru
 
           if ($process.ExitCode -ne 0) {
-              Write-Error "Tailscale installation failed. MSI exit code: $($process.ExitCode)"
+              Write-Error `
+                "Tailscale installation failed. MSI exit code: $($process.ExitCode)"
               exit 1
           }
 
           Write-Host "Tailscale installation completed."
 
-          # Remove installer
           Remove-Item `
             -Path $installerPath `
             -Force `
@@ -201,9 +209,9 @@ jobs:
           Write-Host "=== Locating Tailscale CLI ==="
 
           $possiblePaths = @(
-              (Join-Path ${env:ProgramFiles} "Tailscale\tailscale.exe"),
-              (Join-Path ${env:ProgramFiles(x86)} "Tailscale\tailscale.exe"),
-              (Join-Path $env:ProgramData "Tailscale\tailscale.exe")
+            (Join-Path ${env:ProgramFiles} "Tailscale\tailscale.exe"),
+            (Join-Path ${env:ProgramFiles(x86)} "Tailscale\tailscale.exe"),
+            (Join-Path $env:ProgramData "Tailscale\tailscale.exe")
           )
 
           $tailscaleExe = $null
@@ -217,8 +225,16 @@ jobs:
 
           # Fallback search
           if (-not $tailscaleExe) {
+              $searchRoots = @(
+                ${env:ProgramFiles},
+                ${env:ProgramFiles(x86)},
+                ${env:ProgramData}
+              ) | Where-Object {
+                $_ -and (Test-Path $_)
+              }
+
               $found = Get-ChildItem `
-                -Path ${env:ProgramFiles},${env:ProgramFiles(x86)},${env:ProgramData} `
+                -Path $searchRoots `
                 -Filter "tailscale.exe" `
                 -Recurse `
                 -ErrorAction SilentlyContinue |
@@ -259,12 +275,10 @@ jobs:
               exit 1
           }
 
-          # Unique hostname
           $hostname = "gh-runner-$env:GITHUB_RUN_ID"
 
           Write-Host "Hostname: $hostname"
 
-          # Connect
           & $env:TAILSCALE_EXE up `
             --auth-key="$env:TAILSCALE_AUTH_KEY" `
             --hostname="$hostname"
@@ -281,12 +295,14 @@ jobs:
 
           for ($i = 1; $i -le 20; $i++) {
 
-              Write-Host "Waiting for Tailscale IP... attempt $i/20"
+              Write-Host `
+                "Waiting for Tailscale IP... attempt $i/20"
 
               $candidate = & $env:TAILSCALE_EXE ip -4 2>$null
 
               if ($candidate) {
-                  $candidate = ($candidate | Select-Object -First 1).Trim()
+                  $candidate = `
+                    ($candidate | Select-Object -First 1).Trim()
 
                   if ($candidate -match '^\d{1,3}(\.\d{1,3}){3}$') {
                       $tsIP = $candidate
@@ -307,7 +323,57 @@ jobs:
           "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
       # ============================================================
-      # 6. VERIFY RDP
+      # 6. PREPARE CLIPBOARD
+      # ============================================================
+      - name: Prepare RDP Clipboard
+        shell: powershell
+        run: |
+          Write-Host "=== Preparing RDP Clipboard ==="
+
+          # Re-apply clipboard policy
+          $policyPath = `
+            'HKLM:\SOFTWARE\Policies\Microsoft\Windows NT\Terminal Services'
+
+          New-Item `
+            -Path $policyPath `
+            -Force | Out-Null
+
+          Set-ItemProperty `
+            -Path $policyPath `
+            -Name 'fDisableClip' `
+            -Type DWord `
+            -Value 0
+
+          Set-ItemProperty `
+            -Path `
+            'HKLM:\SYSTEM\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'fDisableClip' `
+            -Type DWord `
+            -Value 0
+
+          # Start clipboard process for the runner session
+          $rdpClip = "$env:WINDIR\System32\rdpclip.exe"
+
+          if (Test-Path $rdpClip) {
+              Get-Process `
+                -Name "rdpclip" `
+                -ErrorAction SilentlyContinue |
+                Stop-Process `
+                  -Force `
+                  -ErrorAction SilentlyContinue
+
+              Start-Process $rdpClip
+
+              Write-Host "rdpclip.exe started."
+          }
+          else {
+              Write-Host "rdpclip.exe not found."
+          }
+
+          Write-Host "Clipboard configuration completed."
+
+      # ============================================================
+      # 7. VERIFY RDP
       # ============================================================
       - name: Verify RDP Accessibility
         shell: powershell
@@ -320,20 +386,26 @@ jobs:
               exit 1
           }
 
-          # Ensure firewall rule exists
-          netsh advfirewall firewall show rule name="RDP-Tailscale"
+          # Firewall
+          Write-Host "Checking firewall rule..."
+          netsh advfirewall firewall show rule `
+            name="RDP-Tailscale"
 
-          # Check RDP service
-          $rdpService = Get-Service -Name TermService
+          # RDP service
+          $rdpService = Get-Service `
+            -Name TermService
 
-          Write-Host "TermService status: $($rdpService.Status)"
+          Write-Host `
+            "TermService status: $($rdpService.Status)"
 
           if ($rdpService.Status -ne "Running") {
-              Start-Service -Name TermService
+              Start-Service `
+                -Name TermService
+
               Start-Sleep -Seconds 3
           }
 
-          # TCP test
+          # TCP 3389
           $test = Test-NetConnection `
             -ComputerName $env:TAILSCALE_IP `
             -Port 3389 `
@@ -347,48 +419,55 @@ jobs:
           Write-Host "RDP TCP connectivity successful."
 
       # ============================================================
-      # 7. SHOW CONNECTION INFORMATION
+      # 8. SHOW CONNECTION INFORMATION
       # ============================================================
       - name: Show RDP Information
         shell: powershell
         run: |
           Write-Host ""
           Write-Host "============================================="
-          Write-Host "             RDP ACCESS"
+          Write-Host "              RDP ACCESS"
           Write-Host "============================================="
           Write-Host "Address : $env:TAILSCALE_IP"
           Write-Host "Port    : 3389"
-          Write-Host "Username: $env:RDP_USERNAME"
+          Write-Host "User    : $env:RDP_USERNAME"
           Write-Host "Password: $env:RDP_PASSWORD"
+          Write-Host "Clipboard: ENABLED"
           Write-Host "============================================="
           Write-Host ""
 
-          # Also add to the GitHub Actions job summary
           @"
           ## RDP ACCESS
 
-          **Address:** `$env:TAILSCALE_IP`:3389
+          **Address:** `$env:TAILSCALE_IP:3389`
 
           **Username:** `$env:RDP_USERNAME`
 
           **Password:** `$env:RDP_PASSWORD`
-          "@ | Out-File `
+
+          **Clipboard:** Enabled
+          "@ |
+          Out-File `
             -FilePath $env:GITHUB_STEP_SUMMARY `
             -Append `
             -Encoding utf8
 
       # ============================================================
-      # 8. KEEP RUNNER ALIVE
+      # 9. KEEP RUNNER ALIVE
       # ============================================================
       - name: Maintain Connection
         shell: powershell
         run: |
           Write-Host ""
           Write-Host "RDP is active."
-          Write-Host "The workflow will remain active until the runner limit is reached or the job is cancelled."
+          Write-Host "Username: $env:RDP_USERNAME"
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
           Write-Host ""
 
           while ($true) {
-              Write-Host "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP Active"
+
+              Write-Host `
+                "[$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')] RDP Active"
+
               Start-Sleep -Seconds 60
           }
